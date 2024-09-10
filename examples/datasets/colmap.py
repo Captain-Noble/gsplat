@@ -6,6 +6,8 @@ import imageio.v2 as imageio
 import numpy as np
 import torch
 from pycolmap import SceneManager
+import read_write_model as rw
+import struct
 
 from .normalize import (
     align_principle_axes,
@@ -45,6 +47,9 @@ class Parser:
         assert os.path.exists(
             colmap_dir
         ), f"COLMAP directory {colmap_dir} does not exist."
+
+        # 检查 .bin 文件是否存在，如果不存在则生成它们
+        self.check_and_generate_bin_files(colmap_dir)
 
         manager = SceneManager(colmap_dir)
         manager.load_cameras()
@@ -236,6 +241,90 @@ class Parser:
         dists = np.linalg.norm(camera_locations - scene_center, axis=1)
         self.scene_scale = np.max(dists)
 
+    def check_and_generate_bin_files(self, colmap_dir):
+        """
+        检查是否存在 cameras.bin, images.bin, points3D.bin 文件。
+        如果它们不存在，使用相应的 .txt 和 .ply 文件生成它们。
+        """
+        cameras_bin_path = os.path.join(colmap_dir, "cameras.bin")
+        images_bin_path = os.path.join(colmap_dir, "images.bin")
+        points3D_bin_path = os.path.join(colmap_dir, "points3D.bin")
+
+        if not (os.path.exists(cameras_bin_path) and os.path.exists(images_bin_path) and os.path.exists(points3D_bin_path)):
+            print("One or more .bin files missing, generating them from .txt and .ply files...")
+
+            cameras_txt_path = os.path.join(colmap_dir, "cameras.txt")
+            images_txt_path = os.path.join(colmap_dir, "images.txt")
+            points3D_ply_path = os.path.join(colmap_dir, "points3D.ply")
+
+            assert os.path.exists(cameras_txt_path), f"{cameras_txt_path} not found."
+            assert os.path.exists(images_txt_path), f"{images_txt_path} not found."
+            assert os.path.exists(points3D_ply_path), f"{points3D_ply_path} not found."
+
+            # 读取 .txt 和 .ply 文件
+            cameras = rw.read_cameras_text(cameras_txt_path)
+            images = rw.read_images_text(images_txt_path)
+            points3D = self.read_ply(points3D_ply_path)
+
+            # 将它们保存为 .bin 文件
+            print(f"Writing {cameras_bin_path}...")
+            rw.write_cameras_binary(cameras, cameras_bin_path)
+
+            print(f"Writing {images_bin_path}...")
+            rw.write_images_binary(images, images_bin_path)
+
+            print(f"Writing {points3D_bin_path}...")
+            self.write_points3D_binary(points3D, points3D_bin_path)
+
+            print("Bin files successfully generated.")
+        else:
+            print("All .bin files are present.")
+
+    def read_ply(self, ply_file_path):
+        """
+        读取 PLY 文件并返回点的坐标、颜色信息。
+        """
+        points = []
+        with open(ply_file_path, 'r') as f:
+            header_ended = False
+            for line in f:
+                if line.startswith("end_header"):
+                    header_ended = True
+                    continue
+                if header_ended:
+                    values = line.strip().split()
+                    if len(values) == 6:
+                        x, y, z = map(float, values[:3])
+                        r, g, b = map(int, values[3:])
+                        points.append([x, y, z, r, g, b])
+        return np.array(points)
+
+    def write_points3D_binary(self, points, output_bin_path):
+        """
+        将点云数据写入符合要求的 .bin 文件。
+        """
+        num_points = len(points)
+        with open(output_bin_path, "wb") as fid:
+            # 写入点的数量
+            fid.write(struct.pack("Q", num_points))
+            
+            for point_id, point in enumerate(points, start=1):
+                x, y, z, r, g, b = point
+                
+                # 写入 point_id (Q -> unsigned long long)
+                fid.write(struct.pack("Q", point_id))
+                
+                # 写入坐标 (ddd -> double)
+                fid.write(struct.pack("ddd", x, y, z))
+                
+                # 写入颜色 (BBB -> unsigned char)
+                fid.write(struct.pack("BBB", int(r), int(g), int(b)))
+                
+                # 写入 error 值 (d -> double)
+                fid.write(struct.pack("d", 0.0))  # error 值为 0
+                
+                # 写入 TRACK[] 长度 (Q -> unsigned long long)
+                fid.write(struct.pack("Q", 0))  # TRACK[] 长度为 0
 
 class Dataset:
     """A simple dataset class."""
