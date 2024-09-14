@@ -204,3 +204,27 @@ def generate_interpolated_path(
         points, n_interp * (points.shape[0] - 1), k=spline_degree, s=smoothness
     )
     return points_to_poses(new_points)
+
+def generate_original_poses(
+    poses: np.ndarray,
+    rot_weight: float = 0.1,
+):
+    """Converts input camera poses to (position, lookat, up) format.
+
+    Args:
+      poses: (n, 3, 4) array of input pose keyframes.
+      rot_weight: relative weighting of rotation/translation.
+
+    Returns:
+      Array of original camera poses in (position, lookat, up) format with shape (n, 3, 3).
+    """
+    
+    def poses_to_points(poses, dist):
+        """Converts from pose matrices to (position, lookat, up) format."""
+        pos = poses[:, :3, -1]  # position is the last column
+        lookat = poses[:, :3, -1] - dist * poses[:, :3, 2]  # lookat is computed with distance
+        up = poses[:, :3, -1] + dist * poses[:, :3, 1]  # up is computed using the up vector
+        return np.stack([pos, lookat, up], axis=1)
+
+    points = poses_to_points(poses, dist=rot_weight)
+    return points

@@ -64,6 +64,8 @@ class Config:
     max_steps: int = 30_000
     # Steps to evaluate the model
     eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    # eval_steps: List[int] = field(default_factory=lambda: list(range(1, 89)))
+
     # Steps to save the model
     save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
 
@@ -235,6 +237,38 @@ def create_splats_with_optimizers(
     }
     return splats, optimizers
 
+def save_depth_images(depth_tensor, step, camera_id, save_dir="depth_images"):
+    # Create directory if it does not exist
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Iterate over each camera (N dimension)
+    N = depth_tensor.shape[0]
+    for i in range(N):
+        # Extract depth map for camera i
+        depth_image = depth_tensor[i].squeeze().detach().cpu().numpy()  # Shape [H, W]
+
+        # Normalize depth values to 0-255 for saving as image
+        depth_image = (depth_image - depth_image.min()) / (depth_image.max() - depth_image.min()) * 255.0
+        depth_image = depth_image.astype(np.uint8)
+
+        # Save the image with a unique name for each camera
+        imageio.imwrite(f"{save_dir}/depth_step_{step:05d}_camera_{camera_id}_{i}.png", depth_image)
+
+def save_color_images(color_tensor, step, camera_id, save_dir="color_images"):
+    # Create directory if it does not exist
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Iterate over each camera (N dimension)
+    N = color_tensor.shape[0]
+    for i in range(N):
+        # Extract color image for camera i
+        color_image = color_tensor[i].squeeze().detach().cpu().numpy()  # Shape [H, W, 3]
+
+        # Normalize color values to 0-255 if necessary (assuming color values are in range [0, 1])
+        color_image = (color_image * 255.0).astype(np.uint8)
+
+        # Save the image with a unique name for each camera
+        imageio.imwrite(f"{save_dir}/color_step_{step:05d}_camera_{camera_id}_{i}.png", color_image)
 
 class Runner:
     """Engine for training and testing."""
@@ -527,12 +561,30 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
-                render_mode="RGB+ED" if cfg.depth_loss else "RGB",
+                render_mode="RGB+ED" #if cfg.depth_loss else "RGB", #temp change
             )
+
             if renders.shape[-1] == 4:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
             else:
                 colors, depths = renders, None
+
+            # save_step = 0
+
+
+            # # save depth
+            # if step<save_step+len(self.parser.camera_ids) and step>save_step:
+            #     if depths != None:
+            #         save_depth_images(depths, step//len(self.parser.camera_ids),step%len(self.parser.camera_ids), cfg.result_dir+"/depths")
+            #     save_color_images(colors, step//len(self.parser.camera_ids),step%len(self.parser.camera_ids), cfg.result_dir+"/colors")
+            # elif step>=save_step+len(self.parser.camera_ids):
+            #     exit(0)
+
+
+            if step == 0:
+                self.render_cam_depths(step)
+                exit(0)
+
 
             if cfg.random_bkgd:
                 bkgd = torch.rand(1, 3, device=device)
@@ -845,6 +897,76 @@ class Runner:
             writer.append_data(canvas)
         writer.close()
         print(f"Video saved to {video_dir}/traj_{step}.mp4")
+
+
+    @torch.no_grad()
+    def render_cam_depths(self, step: int):
+        """Render camera depths and save as individual images."""
+        print("Rendering camera depths...")
+        cfg = self.cfg
+        device = self.device
+
+        # Get camera-to-world matrices and other settings
+        # camtoworlds = self.parser.camtoworlds[5:-5]
+        # print(len(self.parser.camtoworlds))
+        camtoworlds = self.parser.camtoworlds[:]
+        # print(len(camtoworlds))
+        camtoworlds = generate_interpolated_path(camtoworlds, 1)  # [N, 3, 4]
+        # print(len(camtoworlds))
+        camtoworlds = np.concatenate(
+            [
+                camtoworlds,
+                np.repeat(np.array([[[0.0, 0.0, 0.0, 1.0]]]), len(camtoworlds), axis=0),
+            ],
+            axis=1,
+        )  # [N, 4, 4]
+        # print(len(camtoworlds))
+        camtoworlds = torch.from_numpy(camtoworlds).float().to(device)
+        
+        # Get intrinsic parameters and image size
+        K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
+        width, height = list(self.parser.imsize_dict.values())[0]
+
+        # Directory to save depth images
+        depth_dir = f"{cfg.result_dir}/depths"
+        color_dir = f"{cfg.result_dir}/colors"
+        os.makedirs(depth_dir, exist_ok=True)
+
+        # print(len(camtoworlds))
+        # exit(0)
+
+        # Iterate over each camera and render depths
+        for i in tqdm.trange(len(camtoworlds), desc="Rendering camera depths"):
+            renders, _, _ = self.rasterize_splats(
+                # camtoworlds=camtoworlds[i : i + 1],
+                camtoworlds=camtoworlds[i : i + 1],
+                Ks=K[None],
+                width=width,
+                height=height,
+                sh_degree=cfg.sh_degree,
+                near_plane=cfg.near_plane,
+                far_plane=cfg.far_plane,
+                render_mode="RGB+ED",
+            )  # [1, H, W, 4]
+            # debug
+            colors = renders[0, ..., 0:3]  # [H, W, 1]
+            colors = (colors - colors.min()) / (colors.max() - colors.min())  # Normalize to [0, 1]
+            
+            # Convert color map to a NumPy array and scale to [0, 255] for saving as image
+            color_image = (colors.cpu().numpy() * 255).astype(np.uint8)  # [H, W, 3]
+            imageio.imwrite(f"{color_dir}/color_step_{step:05d}_cam_{i}.png", color_image)
+
+            # Extract depth map from render
+            depths = renders[0, ..., 3:4]  # [H, W, 1]
+            depths = (depths - depths.min()) / (depths.max() - depths.min())  # Normalize to [0, 1]
+            
+            # Convert depth map to a NumPy array and scale to [0, 255] for saving as image
+            depth_image = (depths.squeeze().cpu().numpy() * 255).astype(np.uint8)  # [H, W]
+
+            # Save each depth image as PNG
+            imageio.imwrite(f"{depth_dir}/depth_step_{step:05d}_cam_{i}.png", depth_image)
+
+        print(f"Depth images saved to {depth_dir}/ for step {step}")
 
     @torch.no_grad()
     def run_compression(self, step: int):

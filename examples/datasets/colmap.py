@@ -383,6 +383,8 @@ class Dataset:
             "image_id": item,  # the index of the image in the dataset
         }
 
+
+        # FIXME! not having "point_indices = self.parser.point_indices[image_name]"
         if self.load_depths:
             # projected points to image plane to get depths
             worldtocams = np.linalg.inv(camtoworlds)
