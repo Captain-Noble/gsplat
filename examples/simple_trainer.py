@@ -15,7 +15,7 @@ import tyro
 import viser
 import yaml
 from datasets.colmap import Dataset, Parser
-from datasets.traj import generate_interpolated_path
+from datasets.traj import generate_interpolated_path, generate_original_poses
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
@@ -63,11 +63,11 @@ class Config:
     # Number of training steps
     max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [300, 7_000, 30_000])
     # eval_steps: List[int] = field(default_factory=lambda: list(range(1, 89)))
 
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    save_steps: List[int] = field(default_factory=lambda: [300, 7_000, 30_000])
 
     # Initialization strategy
     init_type: str = "sfm"
@@ -490,13 +490,11 @@ class Runner:
         init_step = 0
 
         schedulers = [
-            # means has a learning rate schedule, that end at 0.01 of the initial value
             torch.optim.lr_scheduler.ExponentialLR(
                 self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
             ),
         ]
         if cfg.pose_opt:
-            # pose optimization has a learning rate schedule
             schedulers.append(
                 torch.optim.lr_scheduler.ExponentialLR(
                     self.pose_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
@@ -512,6 +510,9 @@ class Runner:
             pin_memory=True,
         )
         trainloader_iter = iter(trainloader)
+
+        # 变量：第0步渲染深度图
+        initial_depths = {}
 
         # Training loop.
         global_tic = time.time()
@@ -536,9 +537,10 @@ class Runner:
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
             image_ids = data["image_id"].to(device)
-            if cfg.depth_loss:
-                points = data["points"].to(device)  # [1, M, 2]
-                depths_gt = data["depths"].to(device)  # [1, M]
+            
+            # if cfg.depth_loss:
+            #     points = data["points"].to(device)  # [1, M, 2]
+            #     depths_gt = data["depths"].to(device)  # [1, M]
 
             height, width = pixels.shape[1:3]
 
@@ -561,7 +563,7 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
-                render_mode="RGB+ED" #if cfg.depth_loss else "RGB", #temp change
+                render_mode="RGB+ED" # Always render with depth
             )
 
             if renders.shape[-1] == 4:
@@ -569,22 +571,24 @@ class Runner:
             else:
                 colors, depths = renders, None
 
-            # save_step = 0
+            # skip_train = False
+            # 在第0步时，存储所有深度图，基于image_id索引
+            for img_id, depth_map in zip(image_ids, depths):
+                if str(img_id.item()) not in initial_depths:
+                    initial_depths[str(img_id.item())] = depth_map.detach().clone()
+                    print("img_id:",str(img_id.item()))
+                    print("now initial depth dict have ",len(initial_depths)," items")
+                    save_depth_images(depths, step//len(self.parser.camera_ids),img_id.item(), cfg.result_dir+"/depths")
+                    # skip_train = True
+            # if skip_train:
+            #     continue
 
-
-            # # save depth
             # if step<save_step+len(self.parser.camera_ids) and step>save_step:
             #     if depths != None:
             #         save_depth_images(depths, step//len(self.parser.camera_ids),step%len(self.parser.camera_ids), cfg.result_dir+"/depths")
             #     save_color_images(colors, step//len(self.parser.camera_ids),step%len(self.parser.camera_ids), cfg.result_dir+"/colors")
             # elif step>=save_step+len(self.parser.camera_ids):
             #     exit(0)
-
-
-            if step == 0:
-                self.render_cam_depths(step)
-                exit(0)
-
 
             if cfg.random_bkgd:
                 bkgd = torch.rand(1, 3, device=device)
@@ -604,25 +608,17 @@ class Runner:
                 pixels.permute(0, 3, 1, 2), colors.permute(0, 3, 1, 2)
             )
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+
             if cfg.depth_loss:
-                # query depths from depth map
-                points = torch.stack(
-                    [
-                        points[:, :, 0] / (width - 1) * 2 - 1,
-                        points[:, :, 1] / (height - 1) * 2 - 1,
-                    ],
-                    dim=-1,
-                )  # normalize to [-1, 1]
-                grid = points.unsqueeze(2)  # [1, M, 1, 2]
-                depths = F.grid_sample(
-                    depths.permute(0, 3, 1, 2), grid, align_corners=True
-                )  # [1, 1, M, 1]
-                depths = depths.squeeze(3).squeeze(1)  # [1, M]
-                # calculate loss in disparity space
-                disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
-                disp_gt = 1.0 / depths_gt  # [1, M]
-                depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
-                loss += depthloss * cfg.depth_lambda
+                # 获取当前step的深度图并与第0步的深度图对比
+                for img_id, current_depth in zip(image_ids, depths):
+                    initial_depth = initial_depths[str(img_id.item())]  # 第0步的深度图
+                    depthloss = F.mse_loss(current_depth, initial_depth) * self.scene_scale
+                    loss += depthloss * cfg.depth_lambda
+
+            # if skip_train:
+            #     loss = 0
+
 
             # regularizations
             if cfg.opacity_reg > 0.0:
@@ -637,26 +633,18 @@ class Runner:
                     + cfg.scale_reg * torch.abs(torch.exp(self.splats["scales"])).mean()
                 )
 
+            # if not skip_train:
             loss.backward()
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
-                # monitor the pose error if we inject noise
                 pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
                 desc += f"pose err={pose_err.item():.6f}| "
             pbar.set_description(desc)
 
             # write images (gt and render)
-            # if world_rank == 0 and step % 800 == 0:
-            #     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
-            #     canvas = canvas.reshape(-1, *canvas.shape[2:])
-            #     imageio.imwrite(
-            #         f"{self.render_dir}/train_rank{self.world_rank}.png",
-            #         (canvas * 255).astype(np.uint8),
-            #     )
-
             if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
                 self.writer.add_scalar("train/loss", loss.item(), step)
@@ -722,7 +710,6 @@ class Runner:
             else:
                 assert_never(self.cfg.strategy)
 
-            # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:
                 assert cfg.packed, "Sparse gradients only work with packed mode."
                 gaussian_ids = info["gaussian_ids"]
@@ -737,7 +724,6 @@ class Runner:
                         is_coalesced=len(Ks) == 1,
                     )
 
-            # optimize
             for optimizer in self.optimizers.values():
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -750,12 +736,10 @@ class Runner:
             for scheduler in schedulers:
                 scheduler.step()
 
-            # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
                 self.eval(step)
                 self.render_traj(step)
 
-            # run compression
             if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
                 self.run_compression(step=step)
 
@@ -765,10 +749,244 @@ class Runner:
                 num_train_rays_per_sec = (
                     num_train_rays_per_step * num_train_steps_per_sec
                 )
-                # Update the viewer state.
                 self.viewer.state.num_train_rays_per_sec = num_train_rays_per_sec
-                # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
+
+        @torch.no_grad()
+        def eval(self, step: int, stage: str = "val"):
+            """Entry for evaluation."""
+            print("Running evaluation...")
+            cfg = self.cfg
+            device = self.device
+            world_rank = self.world_rank
+            world_size = self.world_size
+
+            valloader = torch.utils.data.DataLoader(
+                self.valset, batch_size=1, shuffle=False, num_workers=1
+            )
+            ellipse_time = 0
+            metrics = {"psnr": [], "ssim": [], "lpips": []}
+            for i, data in enumerate(valloader):
+                camtoworlds = data["camtoworld"].to(device)
+                Ks = data["K"].to(device)
+                pixels = data["image"].to(device) / 255.0
+                height, width = pixels.shape[1:3]
+
+                torch.cuda.synchronize()
+                tic = time.time()
+                colors, _, _ = self.rasterize_splats(
+                    camtoworlds=camtoworlds,
+                    Ks=Ks,
+                    width=width,
+                    height=height,
+                    sh_degree=cfg.sh_degree,
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane,
+                )  # [1, H, W, 3]
+                colors = torch.clamp(colors, 0.0, 1.0)
+                torch.cuda.synchronize()
+                ellipse_time += time.time() - tic
+
+                if world_rank == 0:
+                    # write images
+                    canvas = torch.cat([pixels, colors], dim=2).squeeze(0).cpu().numpy()
+                    imageio.imwrite(
+                        f"{self.render_dir}/{stage}_{i:04d}.png",
+                        (canvas * 255).astype(np.uint8),
+                    )
+
+                    pixels = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
+                    colors = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
+                    metrics["psnr"].append(self.psnr(colors, pixels))
+                    metrics["ssim"].append(self.ssim(colors, pixels))
+                    metrics["lpips"].append(self.lpips(colors, pixels))
+
+            if world_rank == 0:
+                ellipse_time /= len(valloader)
+
+                psnr = torch.stack(metrics["psnr"]).mean()
+                ssim = torch.stack(metrics["ssim"]).mean()
+                lpips = torch.stack(metrics["lpips"]).mean()
+                print(
+                    f"PSNR: {psnr.item():.3f}, SSIM: {ssim.item():.4f}, LPIPS: {lpips.item():.3f} "
+                    f"Time: {ellipse_time:.3f}s/image "
+                    f"Number of GS: {len(self.splats['means'])}"
+                )
+                # save stats as json
+                stats = {
+                    "psnr": psnr.item(),
+                    "ssim": ssim.item(),
+                    "lpips": lpips.item(),
+                    "ellipse_time": ellipse_time,
+                    "num_GS": len(self.splats["means"]),
+                }
+                with open(f"{self.stats_dir}/{stage}_step{step:04d}.json", "w") as f:
+                    json.dump(stats, f)
+                # save stats to tensorboard
+                for k, v in stats.items():
+                    self.writer.add_scalar(f"{stage}/{k}", v, step)
+                self.writer.flush()
+
+        @torch.no_grad()
+        def render_traj(self, step: int):
+            """Entry for trajectory rendering."""
+            print("Running trajectory rendering...")
+            cfg = self.cfg
+            device = self.device
+
+            camtoworlds = self.parser.camtoworlds[5:-5]
+            camtoworlds = generate_interpolated_path(camtoworlds, 1)  # [N, 3, 4]
+            camtoworlds = np.concatenate(
+                [
+                    camtoworlds,
+                    np.repeat(np.array([[[0.0, 0.0, 0.0, 1.0]]]), len(camtoworlds), axis=0),
+                ],
+                axis=1,
+            )  # [N, 4, 4]
+
+            camtoworlds = torch.from_numpy(camtoworlds).float().to(device)
+            K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
+            width, height = list(self.parser.imsize_dict.values())[0]
+
+            canvas_all = []
+            for i in tqdm.trange(len(camtoworlds), desc="Rendering trajectory"):
+                renders, _, _ = self.rasterize_splats(
+                    camtoworlds=camtoworlds[i : i + 1],
+                    Ks=K[None],
+                    width=width,
+                    height=height,
+                    sh_degree=cfg.sh_degree,
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane,
+                    render_mode="RGB+ED",
+                )  # [1, H, W, 4]
+                colors = torch.clamp(renders[0, ..., 0:3], 0.0, 1.0)  # [H, W, 3]
+                depths = renders[0, ..., 3:4]  # [H, W, 1]
+                depths = (depths - depths.min()) / (depths.max() - depths.min())
+
+                # write images
+                canvas = torch.cat(
+                    [colors, depths.repeat(1, 1, 3)], dim=0 if width > height else 1
+                )
+                canvas = (canvas.cpu().numpy() * 255).astype(np.uint8)
+                canvas_all.append(canvas)
+
+            # save to video
+            video_dir = f"{cfg.result_dir}/videos"
+            os.makedirs(video_dir, exist_ok=True)
+            writer = imageio.get_writer(f"{video_dir}/traj_{step}.mp4", fps=30)
+            for canvas in canvas_all:
+                writer.append_data(canvas)
+            writer.close()
+            print(f"Video saved to {video_dir}/traj_{step}.mp4")
+
+
+        @torch.no_grad()
+        def render_cam_depths(self, step: int):
+            """Render camera depths and save as individual images."""
+            print("Rendering camera depths...")
+            cfg = self.cfg
+            device = self.device
+
+            # Get camera-to-world matrices and other settings
+            # camtoworlds = self.parser.camtoworlds[5:-5]
+            # print(len(self.parser.camtoworlds))
+            camtoworlds = self.parser.camtoworlds[:]
+            # print(len(camtoworlds))
+            camtoworlds = generate_original_poses(camtoworlds)
+            # print(len(camtoworlds))
+            camtoworlds = np.concatenate(
+                [
+                    camtoworlds,
+                    np.repeat(np.array([[[0.0, 0.0, 0.0, 1.0]]]), len(camtoworlds), axis=0),
+                ],
+                axis=1,
+            )  # [N, 4, 4]
+            # print(len(camtoworlds))
+            camtoworlds = torch.from_numpy(camtoworlds).float().to(device)
+            
+            # Get intrinsic parameters and image size
+            K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
+            width, height = list(self.parser.imsize_dict.values())[0]
+
+            # Directory to save depth images
+            depth_dir = f"{cfg.result_dir}/depths"
+            color_dir = f"{cfg.result_dir}/colors"
+            os.makedirs(depth_dir, exist_ok=True)
+
+            # print(len(camtoworlds))
+            # exit(0)
+
+            # Iterate over each camera and render depths
+            for i in tqdm.trange(len(camtoworlds), desc="Rendering camera depths"):
+                renders, _, _ = self.rasterize_splats(
+                    # camtoworlds=camtoworlds[i : i + 1],
+                    camtoworlds=camtoworlds[i : i + 1],
+                    Ks=K[None],
+                    width=width,
+                    height=height,
+                    sh_degree=cfg.sh_degree,
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane,
+                    render_mode="RGB+ED",
+                )  # [1, H, W, 4]
+                # debug
+                colors = renders[0, ..., 0:3]  # [H, W, 1]
+                colors = (colors - colors.min()) / (colors.max() - colors.min())  # Normalize to [0, 1]
+                
+                # Convert color map to a NumPy array and scale to [0, 255] for saving as image
+                color_image = (colors.cpu().numpy() * 255).astype(np.uint8)  # [H, W, 3]
+                imageio.imwrite(f"{color_dir}/color_step_{step:05d}_cam_{i}.png", color_image)
+
+                # Extract depth map from render
+                depths = renders[0, ..., 3:4]  # [H, W, 1]
+                depths = (depths - depths.min()) / (depths.max() - depths.min())  # Normalize to [0, 1]
+                
+                # Convert depth map to a NumPy array and scale to [0, 255] for saving as image
+                depth_image = (depths.squeeze().cpu().numpy() * 255).astype(np.uint8)  # [H, W]
+
+                # Save each depth image as PNG
+                imageio.imwrite(f"{depth_dir}/depth_step_{step:05d}_cam_{i}.png", depth_image)
+
+            print(f"Depth images saved to {depth_dir}/ for step {step}")
+
+        @torch.no_grad()
+        def run_compression(self, step: int):
+            """Entry for running compression."""
+            print("Running compression...")
+            world_rank = self.world_rank
+
+            compress_dir = f"{cfg.result_dir}/compression/rank{world_rank}"
+            os.makedirs(compress_dir, exist_ok=True)
+
+            self.compression_method.compress(compress_dir, self.splats)
+
+            # evaluate compression
+            splats_c = self.compression_method.decompress(compress_dir)
+            for k in splats_c.keys():
+                self.splats[k].data = splats_c[k].to(self.device)
+            self.eval(step=step, stage="compress")
+
+        @torch.no_grad()
+        def _viewer_render_fn(
+            self, camera_state: nerfview.CameraState, img_wh: Tuple[int, int]
+        ):
+            """Callable function for the viewer."""
+            W, H = img_wh
+            c2w = camera_state.c2w
+            K = camera_state.get_K(img_wh)
+            c2w = torch.from_numpy(c2w).float().to(self.device)
+            K = torch.from_numpy(K).float().to(self.device)
+
+            render_colors, _, _ = self.rasterize_splats(
+                camtoworlds=c2w[None],
+                Ks=K[None],
+                width=W,
+                height=H,
+                sh_degree=self.cfg.sh_degree,  # active all SH degrees
+                radius_clip=3.0,  # skip GSs that have small image radius (in pixels)
+            )  # [1, H, W, 3]
+            return render_colors[0].cpu().numpy()
 
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):
@@ -911,7 +1129,7 @@ class Runner:
         # print(len(self.parser.camtoworlds))
         camtoworlds = self.parser.camtoworlds[:]
         # print(len(camtoworlds))
-        camtoworlds = generate_interpolated_path(camtoworlds, 1)  # [N, 3, 4]
+        camtoworlds = generate_original_poses(camtoworlds)
         # print(len(camtoworlds))
         camtoworlds = np.concatenate(
             [

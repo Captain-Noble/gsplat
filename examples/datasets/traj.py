@@ -209,14 +209,14 @@ def generate_original_poses(
     poses: np.ndarray,
     rot_weight: float = 0.1,
 ):
-    """Converts input camera poses to (position, lookat, up) format.
+    """Converts input camera poses to the same format as the interpolated output.
 
     Args:
       poses: (n, 3, 4) array of input pose keyframes.
-      rot_weight: relative weighting of rotation/translation.
+      rot_weight: relative weighting of rotation/translation in spline solve.
 
     Returns:
-      Array of original camera poses in (position, lookat, up) format with shape (n, 3, 3).
+      Array of original camera poses with shape (n, 3, 4).
     """
     
     def poses_to_points(poses, dist):
@@ -226,5 +226,10 @@ def generate_original_poses(
         up = poses[:, :3, -1] + dist * poses[:, :3, 1]  # up is computed using the up vector
         return np.stack([pos, lookat, up], axis=1)
 
+    def points_to_poses(points):
+        """Converts from (position, lookat, up) format back to pose matrices."""
+        return np.array([viewmatrix(p - l, u - p, p) for p, l, u in points])
+
     points = poses_to_points(poses, dist=rot_weight)
-    return points
+    original_poses = points_to_poses(points)
+    return original_poses

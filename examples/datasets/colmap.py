@@ -41,7 +41,7 @@ class Parser:
         self.normalize = normalize
         self.test_every = test_every
 
-        colmap_dir = os.path.join(data_dir, "sparse/0/")
+        colmap_dir = os.path.join(data_dir, "sparse/0" )
         if not os.path.exists(colmap_dir):
             colmap_dir = os.path.join(data_dir, "sparse")
         assert os.path.exists(
@@ -159,6 +159,8 @@ class Parser:
         points_err = manager.point3D_errors.astype(np.float32)
         points_rgb = manager.point3D_colors.astype(np.uint8)
         point_indices = dict()
+        # print( manager.point3D_id_to_images.items())
+        # exit(0)
 
         image_id_to_name = {v: k for k, v in manager.name_to_image_id.items()}
         for point_id, data in manager.point3D_id_to_images.items():
@@ -385,31 +387,37 @@ class Dataset:
 
 
         # FIXME! not having "point_indices = self.parser.point_indices[image_name]"
-        if self.load_depths:
-            # projected points to image plane to get depths
-            worldtocams = np.linalg.inv(camtoworlds)
-            image_name = self.parser.image_names[index]
-            point_indices = self.parser.point_indices[image_name]
-            points_world = self.parser.points[point_indices]
-            points_cam = (worldtocams[:3, :3] @ points_world.T + worldtocams[:3, 3:4]).T
-            points_proj = (K @ points_cam.T).T
-            points = points_proj[:, :2] / points_proj[:, 2:3]  # (M, 2)
-            depths = points_cam[:, 2]  # (M,)
-            if self.patch_size is not None:
-                points[:, 0] -= x
-                points[:, 1] -= y
-            # filter out points outside the image
-            selector = (
-                (points[:, 0] >= 0)
-                & (points[:, 0] < image.shape[1])
-                & (points[:, 1] >= 0)
-                & (points[:, 1] < image.shape[0])
-                & (depths > 0)
-            )
-            points = points[selector]
-            depths = depths[selector]
-            data["points"] = torch.from_numpy(points).float()
-            data["depths"] = torch.from_numpy(depths).float()
+        # if self.load_depths:
+        #     # projected points to image plane to get depths
+        #     worldtocams = np.linalg.inv(camtoworlds)
+        #     image_name = self.parser.image_names[index]
+        #     try:
+        #         point_indices = self.parser.point_indices[image_name]
+        #     except:
+        #         print("error:")
+        #         print("self.parser.point_indices:")
+        #         print(self.parser.point_indices)
+        #         # exit(0)
+        #     points_world = self.parser.points[point_indices]
+        #     points_cam = (worldtocams[:3, :3] @ points_world.T + worldtocams[:3, 3:4]).T
+        #     points_proj = (K @ points_cam.T).T
+        #     points = points_proj[:, :2] / points_proj[:, 2:3]  # (M, 2)
+        #     depths = points_cam[:, 2]  # (M,)
+        #     if self.patch_size is not None:
+        #         points[:, 0] -= x
+        #         points[:, 1] -= y
+        #     # filter out points outside the image
+        #     selector = (
+        #         (points[:, 0] >= 0)
+        #         & (points[:, 0] < image.shape[1])
+        #         & (points[:, 1] >= 0)
+        #         & (points[:, 1] < image.shape[0])
+        #         & (depths > 0)
+        #     )
+        #     points = points[selector]
+        #     depths = depths[selector]
+        #     data["points"] = torch.from_numpy(points).float()
+        #     data["depths"] = torch.from_numpy(depths).float()
 
         return data
 
